@@ -6,7 +6,6 @@ on:
     paths:
       - "OutlookAgentBridge/**"
       - "scripts/build-windows-exe.ps1"
-      - "scripts/install-and-run-latest.ps1"
       - ".github/workflows/build-windows-exe.yml"
 
 jobs:
