@@ -1,132 +1,344 @@
-# OutlookAgentBridge (Real App + Direct Download ZIP Release)
+# Outlook Classic AI Bridge — Windows Setup Guide (Working Starter)
 
-You are absolutely right: you should not have to run `dotnet new` just to use this.
+This is a practical, end-to-end setup to run a **local agent bridge** against **Outlook Classic (desktop app)** with no Microsoft 365 admin consent flow.
 
-This repo now has:
-- a real app project (`OutlookAgentBridge/`)
-- a CI build workflow
-- a **Release workflow** that publishes a downloadable ZIP containing `OutlookAgentBridge.exe`
+## 0) What you will get
 
----
-
-## What to do now (no SDK on your PC)
-
-### 1) Download ready-to-run app from GitHub Releases
-
-1. Open this repo on GitHub.
-2. Go to **Actions** → run **Release Windows EXE**.
-3. For `tag`, enter something like `v0.1.0`.
-4. Wait for completion.
-5. Go to **Releases** and download `OutlookAgentBridge-win-x64.zip`.
-6. Unzip anywhere (example: `C:\outlook-agent-bridge\app`).
-
-This path does **not** require .NET SDK on your machine.
-
----
-
-## Run the app on Windows
-
-Open PowerShell in the extracted folder:
-
-```powershell
-$env:OUTLOOK_BRIDGE_TOKEN = "replace-with-long-random-token"
-.\OutlookAgentBridge.exe
-```
-
-API base URL:
-- `http://127.0.0.1:5077`
-
-Header required on all calls:
-- `X-Bridge-Token: <same token>`
-
----
-
-## Implemented endpoints
-
-- `GET /health`
-- `GET /email/unread?limit=25`
-- `POST /folder/create`
-- `POST /email/move`
-- `POST /email/category`
-- `POST /email/draft-reply`
-
-These cover what you asked for:
+A local Windows service (localhost only) that can:
 - read emails
-- sort/move into folders
-- categorize
+- move emails to folders
+- set categories
 - create folders
 - draft replies
 
+Your AI agent calls this local API; the API does COM automation into Outlook.
+
 ---
 
-## Quick test commands (PowerShell)
+## 1) Prerequisites (Windows)
+
+1. Windows 10/11 with **Outlook Classic** installed and signed in.
+2. .NET 8 SDK installed (`dotnet --version`).
+3. Outlook desktop must have your mailbox profile fully synced.
+4. In Outlook Trust Center, keep programmatic access allowed (default typically works if AV is healthy).
+
+> Important: This uses your logged-in Windows/Outlook user context. Run the bridge as that same user.
+
+---
+
+## 2) Create project
+
+Open PowerShell:
 
 ```powershell
-$h = @{ "X-Bridge-Token" = "replace-with-long-random-token" }
+mkdir C:\outlook-agent-bridge
+cd C:\outlook-agent-bridge
+dotnet new webapi -n OutlookAgentBridge --no-https
+cd .\OutlookAgentBridge
+```
+
+Install package for COM interop support:
+
+```powershell
+dotnet add package Microsoft.Windows.Compatibility
+```
+
+Replace `Program.cs` with the code below.
+
+---
+
+## 3) Working starter `Program.cs`
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using System.Runtime.InteropServices;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+var token = Environment.GetEnvironmentVariable("OUTLOOK_BRIDGE_TOKEN")
+            ?? "change-me-in-env";
+
+bool IsAuthorized(HttpRequest req)
+{
+    return req.Headers.TryGetValue("X-Bridge-Token", out var provided)
+           && provided == token;
+}
+
+app.Use(async (ctx, next) =>
+{
+    if (!IsAuthorized(ctx.Request))
+    {
+        ctx.Response.StatusCode = 401;
+        await ctx.Response.WriteAsync("Unauthorized");
+        return;
+    }
+    await next();
+});
+
+app.MapGet("/health", () => Results.Ok(new { ok = true }));
+
+app.MapGet("/email/unread", ([FromQuery] int limit = 25) =>
+{
+    return RunSta(() =>
+    {
+        dynamic outlook = Activator.CreateInstance(Type.GetTypeFromProgID("Outlook.Application")!);
+        dynamic ns = outlook.GetNamespace("MAPI");
+        dynamic inbox = ns.GetDefaultFolder(6); // olFolderInbox
+        dynamic items = inbox.Items;
+        items.Sort("[ReceivedTime]", true);
+
+        var unread = new List<object>();
+        int count = items.Count;
+        for (int i = 1; i <= count && unread.Count < limit; i++)
+        {
+            dynamic item = items[i];
+            try
+            {
+                if (item.Class == 43 && item.UnRead) // 43 = MailItem
+                {
+                    unread.Add(new
+                    {
+                        entryId = (string)item.EntryID,
+                        subject = (string)(item.Subject ?? ""),
+                        sender = (string)(item.SenderEmailAddress ?? ""),
+                        received = (DateTime)item.ReceivedTime
+                    });
+                }
+            }
+            finally
+            {
+                if (item != null) Marshal.ReleaseComObject(item);
+            }
+        }
+
+        Marshal.ReleaseComObject(items);
+        Marshal.ReleaseComObject(inbox);
+        Marshal.ReleaseComObject(ns);
+        Marshal.ReleaseComObject(outlook);
+
+        return Results.Ok(unread);
+    });
+});
+
+app.MapPost("/folder/create", ([FromBody] CreateFolderRequest req) =>
+{
+    return RunSta(() =>
+    {
+        dynamic outlook = Activator.CreateInstance(Type.GetTypeFromProgID("Outlook.Application")!);
+        dynamic ns = outlook.GetNamespace("MAPI");
+        dynamic inbox = ns.GetDefaultFolder(6);
+
+        dynamic folder = inbox.Folders.Add(req.Name);
+
+        var result = Results.Ok(new { created = true, name = (string)folder.Name });
+
+        Marshal.ReleaseComObject(folder);
+        Marshal.ReleaseComObject(inbox);
+        Marshal.ReleaseComObject(ns);
+        Marshal.ReleaseComObject(outlook);
+
+        return result;
+    });
+});
+
+app.MapPost("/email/move", ([FromBody] MoveEmailRequest req) =>
+{
+    return RunSta(() =>
+    {
+        dynamic outlook = Activator.CreateInstance(Type.GetTypeFromProgID("Outlook.Application")!);
+        dynamic ns = outlook.GetNamespace("MAPI");
+
+        dynamic mail = ns.GetItemFromID(req.EntryId);
+        dynamic inbox = ns.GetDefaultFolder(6);
+        dynamic target = inbox.Folders[req.TargetFolderName];
+
+        mail.Move(target);
+
+        Marshal.ReleaseComObject(target);
+        Marshal.ReleaseComObject(inbox);
+        Marshal.ReleaseComObject(mail);
+        Marshal.ReleaseComObject(ns);
+        Marshal.ReleaseComObject(outlook);
+
+        return Results.Ok(new { moved = true });
+    });
+});
+
+app.MapPost("/email/category", ([FromBody] CategorizeEmailRequest req) =>
+{
+    return RunSta(() =>
+    {
+        dynamic outlook = Activator.CreateInstance(Type.GetTypeFromProgID("Outlook.Application")!);
+        dynamic ns = outlook.GetNamespace("MAPI");
+        dynamic mail = ns.GetItemFromID(req.EntryId);
+
+        // Outlook category string is semicolon-delimited
+        mail.Categories = string.Join(";", req.Categories);
+        mail.Save();
+
+        Marshal.ReleaseComObject(mail);
+        Marshal.ReleaseComObject(ns);
+        Marshal.ReleaseComObject(outlook);
+
+        return Results.Ok(new { categorized = true });
+    });
+});
+
+app.MapPost("/email/draft-reply", ([FromBody] DraftReplyRequest req) =>
+{
+    return RunSta(() =>
+    {
+        dynamic outlook = Activator.CreateInstance(Type.GetTypeFromProgID("Outlook.Application")!);
+        dynamic ns = outlook.GetNamespace("MAPI");
+        dynamic mail = ns.GetItemFromID(req.EntryId);
+
+        dynamic reply = mail.Reply();
+        reply.Body = req.Body + "\r\n\r\n" + reply.Body;
+        reply.Save(); // saves to Drafts
+
+        string draftId = reply.EntryID;
+
+        Marshal.ReleaseComObject(reply);
+        Marshal.ReleaseComObject(mail);
+        Marshal.ReleaseComObject(ns);
+        Marshal.ReleaseComObject(outlook);
+
+        return Results.Ok(new { drafted = true, draftEntryId = draftId });
+    });
+});
+
+app.Run("http://127.0.0.1:5077");
+
+static IResult RunSta(Func<IResult> action)
+{
+    IResult? result = null;
+    Exception? error = null;
+
+    var thread = new Thread(() =>
+    {
+        try { result = action(); }
+        catch (Exception ex) { error = ex; }
+    });
+
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+
+    if (error != null)
+        return Results.Problem(error.Message);
+
+    return result!;
+}
+
+record CreateFolderRequest(string Name);
+record MoveEmailRequest(string EntryId, string TargetFolderName);
+record CategorizeEmailRequest(string EntryId, string[] Categories);
+record DraftReplyRequest(string EntryId, string Body);
+```
+
+---
+
+## 4) Run it
+
+In PowerShell:
+
+```powershell
+$env:OUTLOOK_BRIDGE_TOKEN = "super-long-random-token"
+dotnet run
+```
+
+Service listens on `http://127.0.0.1:5077`.
+
+---
+
+## 5) Quick API tests
+
+Use another PowerShell window.
+
+```powershell
+$h = @{ "X-Bridge-Token" = "super-long-random-token" }
 Invoke-RestMethod -Headers $h -Uri "http://127.0.0.1:5077/email/unread?limit=5"
 ```
 
 Create folder:
 
 ```powershell
-Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" `
-  -Uri "http://127.0.0.1:5077/folder/create" `
+Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" \
+  -Uri "http://127.0.0.1:5077/folder/create" \
   -Body '{"name":"AI - Needs Review"}'
 ```
 
 Move email:
 
 ```powershell
-Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" `
-  -Uri "http://127.0.0.1:5077/email/move" `
+Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" \
+  -Uri "http://127.0.0.1:5077/email/move" \
   -Body '{"entryId":"<ENTRY_ID>","targetFolderName":"AI - Needs Review"}'
 ```
 
 Set categories:
 
 ```powershell
-Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" `
-  -Uri "http://127.0.0.1:5077/email/category" `
+Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" \
+  -Uri "http://127.0.0.1:5077/email/category" \
   -Body '{"entryId":"<ENTRY_ID>","categories":["AI","Follow Up"]}'
 ```
 
 Draft reply:
 
 ```powershell
-Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" `
-  -Uri "http://127.0.0.1:5077/email/draft-reply" `
+Invoke-RestMethod -Headers $h -Method Post -ContentType "application/json" \
+  -Uri "http://127.0.0.1:5077/email/draft-reply" \
   -Body '{"entryId":"<ENTRY_ID>","body":"Thanks — I reviewed this and will reply in detail by tomorrow."}'
 ```
 
 ---
 
-## If you are building (optional)
+## 6) Connect your AI agent
 
-You only need this if you want to compile locally.
+Point your agent tools to localhost endpoints. Recommended tool set:
+- `list_unread(limit)` -> `/email/unread`
+- `create_folder(name)` -> `/folder/create`
+- `move_email(entryId, targetFolderName)` -> `/email/move`
+- `categorize_email(entryId, categories[])` -> `/email/category`
+- `draft_reply(entryId, body)` -> `/email/draft-reply`
 
-```powershell
-./scripts/build-windows-exe.ps1
-```
-
-If `dotnet` is missing, install SDK first:
-
-```powershell
-winget install Microsoft.DotNet.SDK.8
-```
-
----
-
-## Files added for this
-
-- App: `OutlookAgentBridge/OutlookAgentBridge.csproj`, `OutlookAgentBridge/Program.cs`
-- Build script: `scripts/build-windows-exe.ps1`
-- CI build artifact workflow: `.github/workflows/build-windows-exe.yml`
-- Release ZIP workflow: `.github/workflows/release-windows-exe.yml`
+Policy recommendations:
+- Keep "send" out of scope initially.
+- Only allow folder names under a prefix (`AI - ...`).
+- Add audit logging for every action.
 
 ---
 
-## Important notes
+## 7) Make it reliable for daily use
 
-- Run the bridge as the same Windows user profile that has Outlook configured.
-- Outlook Classic desktop app must be installed and signed in.
-- COM calls are handled on STA threads in the implementation.
+1. Run this app via Task Scheduler at logon (user context, highest privileges not required).
+2. Keep Outlook running (or add startup check and launch logic).
+3. Add a local SQLite audit table:
+   - timestamp
+   - action
+   - entryId
+   - result
+4. Add a manual approval queue for bulk moves.
+
+---
+
+## 8) Known Outlook COM gotchas
+
+- COM automation must run in STA threads (handled above).
+- `EntryID` may change if items move across stores/accounts.
+- Some antivirus/policy setups can trigger Outlook "programmatic access" prompts.
+- Avoid high-frequency polling; batch reads are safer.
+
+---
+
+## 9) Next upgrade path
+
+After this starter works, split into:
+- `OutlookAgentBridge.Api` (HTTP API)
+- `OutlookAgentBridge.Outlook` (COM adapter)
+- `OutlookAgentBridge.Policy` (allow/deny rules)
+- `OutlookAgentBridge.Audit` (logging)
+
+This gives you exactly what you asked for: read all emails, sort/move, categorize, create folders, and draft replies with local control and no M365 admin consent dependency.
