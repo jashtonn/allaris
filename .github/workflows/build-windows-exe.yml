@@ -1,0 +1,31 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "OutlookAgentBridge/**"
+      - "scripts/build-windows-exe.ps1"
+      - "scripts/install-and-run-latest.ps1"
+      - ".github/workflows/build-windows-exe.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish self-contained exe
+        shell: pwsh
+        run: ./scripts/build-windows-exe.ps1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OutlookAgentBridge-win-x64
+          path: OutlookAgentBridge/bin/Release/net8.0-windows/win-x64/publish/
